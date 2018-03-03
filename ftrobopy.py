@@ -14,6 +14,8 @@ import socket
 import threading
 import struct
 import time
+import subprocess
+from pathlib import Path
 from math import sqrt, log
 
 __author__      = "Torsten Stuehn"
@@ -30,6 +32,13 @@ try:
   xrange
 except NameError:
   xrange = range
+
+try:
+  from subprocess import DEVNULL  # Python 3.
+except ImportError:
+  DEVNULL = open(os.devnull, 'wb')
+
+cfw = os.path.exists("/etc/fw-ver.txt")
 
 def version():
   """
@@ -157,6 +166,10 @@ class ftTXT(object):
     self._sound_data_idx       = 0
     self._sound_current_rep    = 0
     self._sound_current_volume = 100
+    self._sound_alsa           = False
+    self._sound_alsa_volume    = 100
+    self._sound_alsa_file      = ""
+    self._sound_alsa_proc      = None
     if self._directmode:
       import serial
       self._ser_ms     = serial.Serial(self._ser_port, 230000, timeout=1)
@@ -165,8 +178,10 @@ class ftTXT(object):
       try:
         self._spi      = spidev.SpiDev(1,0) # /dev/spidev1.0
       except:
-        print("Error opening SPI device (this is needed for sound in 'direct'-mode).")
-        # print(error)
+        import semantic_version
+        self._sound_alsa =  semantic_version.Version(Path("/etc/fw-ver.txt").open().read()) in semantic_version.Spec(">=0.9.4")
+        if not self._sound_alsa:
+          print("Error opening SPI device (this is needed for sound in 'direct'-mode).")
         self._spi      = None
       if self._spi:
         self._spi.mode = 3
@@ -179,13 +194,14 @@ class ftTXT(object):
           sys.exit(-1)
         # check if we are running on original-firmware or on community-firmware
         # this is only needed to find the original Sound Files
-        if os.path.isdir('/rom'):
-          self._SoundFilesDir = ('/rom/opt/knobloch/SoundFiles/')
-        else:
-          self._SoundFilesDir = ('/opt/knobloch/SoundFiles/')
-        self._SoundFilesList = os.listdir(self._SoundFilesDir)
-        self._SoundFilesList.sort()
-  
+    if self._spi or self._sound_alsa:
+      if cfw:
+        self._SoundFilesDir = ('/rom/opt/knobloch/SoundFiles/')
+      else:
+        self._SoundFilesDir = ('/opt/knobloch/SoundFiles/')
+      self._SoundFilesList = os.listdir(self._SoundFilesDir)
+      self._SoundFilesList.sort()
+
     else:
       self._sock=socket.socket()
       self._sock.settimeout(5)
@@ -782,6 +798,15 @@ class ftTXT(object):
     self._sound += 1
     self._sound &= 0x0F
     self._exchange_data_lock.release()
+    if self._sound_alsa:
+        if self._sound_alsa_proc:
+          self._sound_alsa_proc.kill()
+          self._sound_alsa_proc.wait()
+          self._sound_alsa_proc = None
+        if self._sound_alsa_file:
+            cmd = "/usr/bin/aplay " + self._sound_alsa_file + ";" * self._sound_repeat
+            print(cmd)
+            self._sound_alsa_proc = subprocess.Popen(cmd, stdout=DEVNULL, stderr=DEVNULL, shell=True)
     return None
 
   def setSoundIndex(self, idx):
@@ -821,6 +846,11 @@ class ftTXT(object):
           self._sound_data_idx = 0
           self._exchange_data_lock.release()
           self._sound_current_volume = 100
+    elif self._sound_alsa:
+        if idx > 0:
+          self._sound_alsa_file = self._SoundFilesDir+self._SoundFilesList[idx-1]
+        else:
+          self._sound_alsa_file = ""
     return None
 
   def getSoundIndex(self):
@@ -886,17 +916,20 @@ class ftTXT(object):
         volume = 100
       if volume < 0:
         volume = 0
-      if volume > self.getSoundVolume():
-        # load wav-file again when increasing volume to get best results
-        self.setSoundIndex(self.getSoundIndex())
-      if self._sound_current_volume != volume:
-        self._sound_current_volume = volume
-        self._exchange_data_lock.acquire()
-        for i in xrange(0, len(self._sound_data)):
-          w = self._sound_current_volume * self._sound_data[i] / 100
-          self._sound_data[i] = int(w) & 0xff
-        self._sound_data_idx = 0
-        self._exchange_data_lock.release()
+      if self._sound_alsa:
+          self._sound_alsa_volume=volume
+      else:
+          if volume > self.getSoundVolume():
+            # load wav-file again when increasing volume to get best results
+            self.setSoundIndex(self.getSoundIndex())
+          if self._sound_current_volume != volume:
+            self._sound_current_volume = volume
+            self._exchange_data_lock.acquire()
+            for i in xrange(0, len(self._sound_data)):
+              w = self._sound_current_volume * self._sound_data[i] / 100
+              self._sound_data[i] = int(w) & 0xff
+            self._sound_data_idx = 0
+            self._exchange_data_lock.release()
     else:
       print("setSoundVolume() steht nur im 'direct'-Modus zur Verfuegung.")
       return None
